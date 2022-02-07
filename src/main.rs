@@ -99,6 +99,7 @@ fn generate_ast_vector_data(
 /// Generate an AST vector from the underlying data
 ///
 /// This is split off into a function so we can handle things like logging and keep the code DRY
+// TODO(afnan) update this so we extract each character/token
 fn generate_ast_vector(data: &AstVectorData) -> AstVector<'_> {
     let ast_vec = AstVector::from_ts_tree(&data.tree, &data.text);
     info!(
@@ -287,7 +288,6 @@ fn main() -> Result<()> {
             .filter_level(log_level)
             .init();
         set_term_colors(args.color_output);
-
         // First check if the input files can be parsed with tree-sitter.
         let files_supported = are_input_files_supported(&args, &config);
 
@@ -326,6 +326,7 @@ mod tests {
             "test data path {} does not exist",
             path_b.to_str().unwrap()
         );
+
         (path_a, path_b)
     }
 

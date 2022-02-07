@@ -6,7 +6,21 @@ use crate::diff::Myers;
 use logging_timer::time;
 use std::{cell::RefCell, ops::Index, path::PathBuf};
 use tree_sitter::Node as TSNode;
+use tree_sitter::Point;
 use tree_sitter::Tree as TSTree;
+use unicode_segmentation as us;
+
+#[derive(Debug, Clone, Copy)]
+pub struct EntryChar<'a> {
+    /// The character that this entry represents
+    pub c: &'a char,
+
+    /// The position of the character
+    pub position: Point,
+
+    /// The position of the character as a byte offset from the beginning of the file.
+    pub byte_offset: u32,
+}
 
 /// A mapping between a tree-sitter node and the text it corresponds to
 #[derive(Debug, Clone, Copy)]
@@ -22,6 +36,84 @@ pub struct Entry<'a> {
     /// This is different from the `source_text` that the [AstVector](AstVector) refers to, as the
     /// entry only holds a reference to the specific range of text that the node covers.
     pub text: &'a str,
+
+    /// An optional override for a node's start position
+    pub start_position: Option<Point>,
+
+    /// An optional override for a node's end position
+    pub end_position: Option<Point>,
+}
+
+impl<'a> Entry<'a> {
+    /// Split the text of an entry by line.
+    pub fn split(self) -> Vec<Self> {
+        let mut entries = Vec::new();
+
+        // This will always reserve enough space, potentially more, because graphemes can be
+        // multiple characters.
+        entries.reserve(self.text.len());
+
+        // TODO(afnan) you can figure out when we've moved onto a new line
+        // if the column indicator resets. This isn't perfect, it won't work if
+        // we go from a column on a previous line to a greater column on the next line
+        let indices = us::UnicodeSegmentation::grapheme_indices(self.text, true);
+
+        for (idx, grapheme) in indices {
+            // Note that the indices here are offsets within the node text, so the column is the
+            // starting column + current idx.
+            let mut new_start_pos = self.reference.start_position();
+            let original_start_col = self.reference.start_position().column;
+            new_start_pos.column = original_start_col + idx;
+
+            let mut new_end_pos = self.reference.start_position();
+            // Every grapheme has to be a at least one byte
+            debug_assert!(!grapheme.is_empty());
+
+            // We substract one because these ranges are [inclusive, exclusive) to match the
+            // tree-sitter indexing scheme.
+            new_end_pos.column = original_start_col + idx + 1;
+
+            debug_assert!(new_start_pos.column <= new_end_pos.column);
+            debug_assert!(new_start_pos.row <= new_end_pos.row);
+
+            let entry = Entry {
+                reference: self.reference,
+                text: &self.text[idx..=idx],
+                start_position: Some(new_start_pos),
+                end_position: Some(new_end_pos),
+            };
+            entries.push(entry);
+        }
+
+        entries
+    }
+
+    pub fn split_from_ast_vector(ast_vector: &'a AstVector<'a>) -> Vec<Self> {
+        let mut entries = Vec::new();
+
+        for entry in &ast_vector.leaves {
+            entries.extend(entry.split().iter());
+        }
+        entries
+    }
+
+    /// Get the start position of an entry
+    pub fn start_position(&self) -> Point {
+        if let Some(pos) = self.start_position {
+            pos
+        } else {
+            self.reference.start_position()
+        }
+    }
+
+    /// Get the end position of an entry
+    pub fn end_position(&self) -> Point {
+        if let Some(pos) = self.end_position {
+            pos
+        } else {
+            self.reference.end_position()
+        }
+    }
 }
 
 /// A vector that allows for linear traversal through the leafs of an AST.
@@ -88,7 +180,7 @@ impl<'a> Index<usize> for AstVector<'a> {
 
 impl<'a> PartialEq for Entry<'a> {
     fn eq(&self, other: &Entry) -> bool {
-        self.text == other.text
+        self.reference.kind_id() == other.reference.kind_id() && self.text == other.text
     }
 }
 
@@ -98,16 +190,19 @@ impl<'a> PartialEq for AstVector<'a> {
             return false;
         }
 
-        // Zip through each entry to determine whether the elements are equal. We start with a
-        // `false` value for not equal and accumulate any inequalities along the way.
-        let not_equal = self
-            .leaves
-            .iter()
-            .zip(other.leaves.iter())
-            .fold(false, |not_equal, (entry_a, entry_b)| {
-                not_equal | (entry_a != entry_b)
-            });
-        !not_equal
+        if self.leaves.len() != other.leaves.len() {
+            return false;
+        }
+
+        for i in 0..self.leaves.len() {
+            let leaf = self.leaves[i];
+            let other_leaf = self.leaves[i];
+
+            if leaf != other_leaf {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -127,6 +222,8 @@ fn build<'a>(vector: &RefCell<Vec<Entry<'a>>>, node: tree_sitter::Node<'a>, text
             vector.borrow_mut().push(Entry {
                 reference: node,
                 text: node_text,
+                start_position: None,
+                end_position: None,
             });
         }
         return;
@@ -164,15 +261,24 @@ pub enum EditType<T> {
 #[time("info", "ast::{}")]
 pub fn compute_edit_script<'a>(a: &'a AstVector, b: &'a AstVector) -> (Hunks<'a>, Hunks<'a>) {
     let myers = Myers::default();
-    let edit_script = myers.diff(&a.leaves[..], &b.leaves[..]);
-    let mut old_edits = Vec::with_capacity(edit_script.len());
-    let mut new_edits = Vec::with_capacity(edit_script.len());
+
+    let a_characters = Entry::split_from_ast_vector(a);
+    let b_characters = Entry::split_from_ast_vector(b);
+    let edit_script = myers.diff(&a_characters[..], &b_characters[..]);
+    let edit_script_len = edit_script.len();
+    // TODO(afnan) convert ast vectors into ast
+
+    // TODO(afnan): update the diff here, maybe update the leaves so we have per-character entries
+    // so we can compute a diff on each character
+    //let edit_script = myers.diff(&a.leaves[..], &b.leaves[..]);
+    let mut old_edits = Vec::with_capacity(edit_script_len);
+    let mut new_edits = Vec::with_capacity(edit_script_len);
 
     for edit in edit_script {
         match edit {
-            EditType::Deletion(&edit) => old_edits.push(edit),
-            EditType::Addition(&edit) => new_edits.push(edit),
-        }
+            EditType::Deletion(&e) => old_edits.push(e),
+            EditType::Addition(&e) => new_edits.push(e),
+        };
     }
 
     // Convert the vectors of edits into hunks that can be displayed
